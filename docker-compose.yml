@@ -1,0 +1,41 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: postgres_fastapi
+    restart: always
+    network_mode: "host"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: fastapi_db
+    command: >
+      postgres -c max_connections=500 -c shared_buffers=512MB -c work_mem=32MB -c effective_cache_size=1GB
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -d fastapi_db" ]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastapi_backend
+    restart: always
+    network_mode: "host"
+    environment:
+      - PROJECT_NAME=FastAPI Clean Architecture Demo
+      - API_V1_STR=/api/v1
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/fastapi_db
+      - USE_MOCK_DB=false
+      - PROMETHEUS_METRICS_ENABLED=true
+      - PROMETHEUS_METRICS_PORT=10001
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/prometheus_multiproc_dir
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
