@@ -1,18 +1,78 @@
-import os
-from app.core.config import settings
-
-# Setup multiprocess environment directory for prometheus_client BEFORE importing prometheus_client
-if settings.PROMETHEUS_MULTIPROC_DIR:
-    os.environ["PROMETHEUS_MULTIPROC_DIR"] = settings.PROMETHEUS_MULTIPROC_DIR
-    os.makedirs(settings.PROMETHEUS_MULTIPROC_DIR, exist_ok=True)
-
+import atexit
+import glob
 import json
 import logging
+import os
 import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Optional
+
+from app.core.config import settings
+
+logger = logging.getLogger("prometheus_metrics")
+
+
+def is_pid_alive(pid: int) -> bool:
+    """Check if a process ID is currently running."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def clean_multiproc_dir(path: Optional[str] = None, clean_all: bool = False) -> None:
+    """
+    Clean up old metrics files (.db, .tmp) from the multiprocess directory.
+
+    :param path: Path to the multiprocess directory.
+    :param clean_all: If True, remove all metric files in directory unconditionally.
+                      If False, remove only files belonging to dead/terminated PIDs.
+    """
+    dir_path = path or os.environ.get("PROMETHEUS_MULTIPROC_DIR") or settings.PROMETHEUS_MULTIPROC_DIR
+    if not dir_path or not os.path.isdir(dir_path):
+        return
+
+    try:
+        for filename in os.listdir(dir_path):
+            file_path = os.path.join(dir_path, filename)
+            if not os.path.isfile(file_path):
+                continue
+
+            should_remove = clean_all
+            if not should_remove:
+                if filename.endswith(".db"):
+                    # Prometheus db files format: <type>_<pid>.db or <type>_<mode>_<pid>.db
+                    parts = filename[:-3].rsplit("_", 1)
+                    if len(parts) == 2 and parts[1].isdigit():
+                        pid = int(parts[1])
+                        if not is_pid_alive(pid):
+                            should_remove = True
+                    else:
+                        should_remove = True
+                elif filename.endswith(".tmp"):
+                    should_remove = True
+
+            if should_remove:
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    logger.debug(f"Error removing stale metrics file {file_path}: {e}")
+    except Exception as e:
+        logger.debug(f"Error scanning multiprocess directory {dir_path}: {e}")
+
+
+# Setup multiprocess environment directory for prometheus_client BEFORE importing prometheus_client
+if settings.PROMETHEUS_MULTIPROC_DIR:
+    os.environ["PROMETHEUS_MULTIPROC_DIR"] = settings.PROMETHEUS_MULTIPROC_DIR
+    os.makedirs(settings.PROMETHEUS_MULTIPROC_DIR, exist_ok=True)
+    # Automatically clean up stale metrics from previous runs / terminated processes
+    clean_multiproc_dir(settings.PROMETHEUS_MULTIPROC_DIR, clean_all=False)
+
 
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -25,7 +85,26 @@ from prometheus_client import (
 )
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-logger = logging.getLogger("prometheus_metrics")
+
+def cleanup_current_process_metrics() -> None:
+    """Cleanup multiprocess metrics files for the current process upon exit or shutdown."""
+    try:
+        pid = os.getpid()
+        multiprocess.mark_process_dead(pid)
+        dir_path = os.environ.get("PROMETHEUS_MULTIPROC_DIR") or settings.PROMETHEUS_MULTIPROC_DIR
+        if dir_path and os.path.isdir(dir_path):
+            for pattern in (f"*_{pid}.db", f"*_{pid}_*.db"):
+                for f in glob.glob(os.path.join(dir_path, pattern)):
+                    try:
+                        os.remove(f)
+                    except Exception:
+                        pass
+    except Exception as e:
+        logger.debug(f"Error cleaning up current process metrics: {e}")
+
+
+atexit.register(cleanup_current_process_metrics)
+
 
 
 def get_host_ip() -> str:

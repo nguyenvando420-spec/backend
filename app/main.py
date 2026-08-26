@@ -3,7 +3,13 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
 from app.core.config import settings
-from app.core.metrics import PrometheusMiddleware, metrics_server, HOST_IP, HOSTNAME
+from app.core.metrics import (
+    PrometheusMiddleware,
+    metrics_server,
+    cleanup_current_process_metrics,
+    HOST_IP,
+    HOSTNAME,
+)
 from app.domain.exceptions.item_exceptions import (
     ItemNotFoundException,
     ItemAlreadyExistsException,
@@ -25,8 +31,10 @@ async def lifespan(app: FastAPI):
     
     yield
     
-    # Shutdown: Stop metrics server
+    # Shutdown: Stop metrics server & cleanup metrics
     metrics_server.stop()
+    cleanup_current_process_metrics()
+
 
 
 app = FastAPI(

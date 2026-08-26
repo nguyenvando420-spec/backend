@@ -1,10 +1,12 @@
+import os
 import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
-from app.core.metrics import metrics_server, get_latest_metrics, HOST_IP, HOSTNAME
+from app.core.metrics import metrics_server, get_latest_metrics, clean_multiproc_dir, HOST_IP, HOSTNAME
 from app.core.config import settings
+
 
 
 @pytest.mark.asyncio
@@ -97,4 +99,37 @@ async def test_dynamic_api_metrics_tracking():
     # The generic placeholder template must NOT be present in metrics
     assert 'handler="/{system}/{router}/{path:path}"' not in raw_metrics
     assert 'handler="/api/v1/{system}/{router}/{path:path}"' not in raw_metrics
+
+
+def test_clean_multiproc_dir_removes_stale_files():
+    """Test that clean_multiproc_dir removes files from dead processes and leaves active ones."""
+    import tempfile
+    from app.core.metrics import clean_multiproc_dir
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Create a stale file with a non-existent PID (e.g. 999999)
+        stale_file = os.path.join(temp_dir, "counter_999999.db")
+        with open(stale_file, "w") as f:
+            f.write("stale_data")
+
+        # Create a file for the current alive process
+        current_pid = os.getpid()
+        active_file = os.path.join(temp_dir, f"counter_{current_pid}.db")
+        with open(active_file, "w") as f:
+            f.write("active_data")
+
+        assert os.path.exists(stale_file)
+        assert os.path.exists(active_file)
+
+        # Run cleanup with clean_all=False (normal startup mode)
+        clean_multiproc_dir(path=temp_dir, clean_all=False)
+
+        # Stale file should be deleted, active file preserved
+        assert not os.path.exists(stale_file)
+        assert os.path.exists(active_file)
+
+        # Run cleanup with clean_all=True (force wipe mode)
+        clean_multiproc_dir(path=temp_dir, clean_all=True)
+        assert not os.path.exists(active_file)
+
 
