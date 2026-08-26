@@ -53,3 +53,48 @@ async def test_metrics_middleware_tracking():
     raw_metrics = get_latest_metrics().decode("utf-8")
     assert "http_requests_total" in raw_metrics
     assert f'host_ip="{HOST_IP}"' in raw_metrics
+
+
+@pytest.mark.asyncio
+async def test_dynamic_api_metrics_tracking():
+    """Test that dynamic routes /{system}/{router}/{path:path} display exact resolved paths in metrics instead of generic template."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # 1. Call dynamic route directly: /crm/users/profile
+        res1 = await client.get("/crm/users/profile")
+        assert res1.status_code == 200
+        data1 = res1.json()
+        assert data1["system"] == "crm"
+        assert data1["router"] == "users"
+        assert data1["path"] == "profile"
+
+        # 2. Call dynamic route with nested path: /billing/invoices/pay/v1
+        res2 = await client.post("/billing/invoices/pay/v1", json={"amount": 500})
+        assert res2.status_code == 200
+        data2 = res2.json()
+        assert data2["system"] == "billing"
+        assert data2["router"] == "invoices"
+        assert data2["path"] == "pay/v1"
+        assert data2["body"] == {"amount": 500}
+
+        # 3. Call dynamic route under /api/v1 prefix: /api/v1/auth/oauth/callback/google
+        res3 = await client.get("/api/v1/auth/oauth/callback/google?code=xyz")
+        assert res3.status_code == 200
+        data3 = res3.json()
+        assert data3["system"] == "auth"
+        assert data3["router"] == "oauth"
+        assert data3["path"] == "callback/google"
+        assert data3["query_params"] == {"code": "xyz"}
+
+    # Verify Prometheus Metrics text contains exact paths, NOT the generic template
+    raw_metrics = get_latest_metrics().decode("utf-8")
+
+    # Exact paths should be recorded in metrics labels
+    assert 'handler="/crm/users/profile"' in raw_metrics
+    assert 'handler="/billing/invoices/pay/v1"' in raw_metrics
+    assert 'handler="/api/v1/auth/oauth/callback/google"' in raw_metrics
+
+    # The generic placeholder template must NOT be present in metrics
+    assert 'handler="/{system}/{router}/{path:path}"' not in raw_metrics
+    assert 'handler="/api/v1/{system}/{router}/{path:path}"' not in raw_metrics
+

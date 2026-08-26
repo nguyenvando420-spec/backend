@@ -131,12 +131,21 @@ class PrometheusMiddleware:
             raise
         finally:
             duration = time.perf_counter() - start_time
-            # Resolve handler / route template for low-cardinality metrics
-            route = scope.get("route") or scope.get("endpoint")
-            if route and hasattr(route, "path"):
-                handler = route.path
+            # Resolve handler / route template for metrics
+            state = scope.get("state", {})
+            if isinstance(state, dict) and "custom_metric_path" in state:
+                handler = state["custom_metric_path"]
             else:
-                handler = scope.get("path", "unknown")
+                route = scope.get("route") or scope.get("endpoint")
+                if route and hasattr(route, "path"):
+                    route_path = route.path
+                    # For dynamic routes with {system}, {router}, {path:path} or catch-all {path}, use actual request path
+                    if "{path" in route_path or "{system}" in route_path or "{router}" in route_path:
+                        handler = scope.get("path", route_path)
+                    else:
+                        handler = route_path
+                else:
+                    handler = scope.get("path", "unknown")
 
             # Update metrics
             try:

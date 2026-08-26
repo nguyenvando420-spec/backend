@@ -11,6 +11,7 @@ from app.domain.exceptions.item_exceptions import (
 )
 from app.infrastructure.database.connection import init_db
 from app.api.v1.routers.item_router import router as item_router
+from app.api.v1.routers.dynamic_router import router as dynamic_router
 
 
 @asynccontextmanager
@@ -66,6 +67,8 @@ async def invalid_item_data_handler(request: Request, exc: InvalidItemDataExcept
 
 # Register Routers
 app.include_router(item_router, prefix=settings.API_V1_STR)
+app.include_router(dynamic_router, prefix=settings.API_V1_STR)
+app.include_router(dynamic_router)
 
 
 @app.get("/", tags=["Health"])
