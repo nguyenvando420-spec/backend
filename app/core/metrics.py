@@ -168,33 +168,113 @@ APP_HOST_INFO.labels(
     service_name=settings.PROJECT_NAME,
 ).set(1)
 
-HTTP_REQUESTS_TOTAL = Counter(
-    "http_requests_total",
-    "Total count of HTTP requests processed",
-    ["method", "handler", "status", "host_ip"],
+# ==========================================
+# 🔹 TẦNG 1: GLOBAL METRICS (BÁO CÁO TỔNG QUAN - 100% TRAFFIC)
+# ==========================================
+HTTP_GLOBAL_REQUESTS_INCOMING_TOTAL = Counter(
+    "http_global_requests_incoming_total",
+    "Total count of incoming HTTP requests received by the server",
+    ["method", "host_ip"],
+)
+
+HTTP_GLOBAL_RESPONSES_TOTAL = Counter(
+    "http_global_responses_total",
+    "Total count of completed HTTP responses returned by the server",
+    ["method", "status", "host_ip"],
+)
+
+HTTP_GLOBAL_REQUESTS_IN_FLIGHT = Gauge(
+    "http_global_requests_in_flight",
+    "Current number of HTTP requests currently being processed",
+    ["host_ip"],
+    multiprocess_mode="livesum",
+)
+
+HTTP_GLOBAL_REQUEST_DURATION_SECONDS = Histogram(
+    "http_global_request_duration_seconds",
+    "Global HTTP request latency distribution across all routes",
+    ["method", "host_ip"],
+    buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+
+# ==========================================
+# 🔸 TẦNG 2: DETAILED METRICS (BÁO CÁO RIÊNG TỪNG ROUTER - CÓ THỂ ẨN / HIDE)
+# Chỉ ghi nhận khi Router đó được BẬT (không bị exclude)
+# ==========================================
+HTTP_REQUESTS_INCOMING_TOTAL = Counter(
+    "http_requests_incoming_total",
+    "Detailed count of incoming HTTP requests for enabled routers",
+    ["method", "handler", "host_ip", "api_group"],
+)
+
+HTTP_RESPONSES_TOTAL = Counter(
+    "http_responses_total",
+    "Detailed count of completed HTTP responses for enabled routers",
+    ["method", "handler", "status", "host_ip", "api_group"],
+)
+
+HTTP_REQUESTS_IN_FLIGHT = Gauge(
+    "http_requests_in_flight",
+    "Current number of HTTP requests currently being processed for enabled routers",
+    ["api_group", "host_ip"],
+    multiprocess_mode="livesum",
 )
 
 HTTP_REQUEST_DURATION_SECONDS = Histogram(
     "http_request_duration_seconds",
-    "HTTP request latency duration in seconds",
-    ["method", "handler", "host_ip"],
+    "Detailed HTTP request latency for enabled routers",
+    ["method", "handler", "host_ip", "api_group"],
     buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
 )
 
 
 class PrometheusMiddleware:
-    """Pure ASGI Middleware for ultra-fast, zero-overhead Prometheus metric tracking."""
+    """Pure ASGI Middleware for ultra-fast, zero-overhead Prometheus 2-tier metric tracking."""
 
     def __init__(self, app: ASGIApp):
         self.app = app
+        raw_paths = getattr(settings, "PROMETHEUS_EXCLUDED_PATHS", "")
+        self.excluded_paths = tuple(p.strip() for p in raw_paths.split(",") if p.strip())
+
+        raw_tags = getattr(settings, "PROMETHEUS_EXCLUDED_TAGS", "")
+        self.excluded_tags = {t.strip().lower() for t in raw_tags.split(",") if t.strip()}
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        start_time = time.perf_counter()
         method = scope.get("method", "GET")
+        path = scope.get("path", "")
+
+        # -------------------------------------------------------------
+        # 📥 1. ĐẾM REQUEST ĐI VÀO (GLOBAL INCOMING) & TĂNG IN-FLIGHT
+        # -------------------------------------------------------------
+        try:
+            HTTP_GLOBAL_REQUESTS_INCOMING_TOTAL.labels(method=method, host_ip=HOST_IP).inc()
+            HTTP_GLOBAL_REQUESTS_IN_FLIGHT.labels(host_ip=HOST_IP).inc()
+        except Exception as e:
+            logger.debug(f"Error recording incoming request metrics: {e}")
+
+        # Tầng 2: Ước lượng api_group ban đầu để đo in-flight nếu router không bị exclude
+        initial_api_group = None
+        if not any(path.startswith(prefix) for prefix in self.excluded_paths):
+            if path in ("/", "/health"):
+                initial_api_group = "System"
+            elif path.startswith("/api/v1/items"):
+                initial_api_group = "Items"
+            elif "/" in path.strip("/"):
+                initial_api_group = "Dynamic APIs"
+
+            if initial_api_group and initial_api_group.lower() not in self.excluded_tags:
+                try:
+                    HTTP_REQUESTS_IN_FLIGHT.labels(api_group=initial_api_group, host_ip=HOST_IP).inc()
+                except Exception as e:
+                    logger.debug(f"Error recording detailed in-flight metric: {e}")
+            else:
+                initial_api_group = None
+
+        start_time = time.perf_counter()
         status_code = 500
 
         async def send_wrapper(message: Message) -> None:
@@ -210,37 +290,106 @@ class PrometheusMiddleware:
             raise
         finally:
             duration = time.perf_counter() - start_time
-            # Resolve handler / route template for metrics
             state = scope.get("state", {})
+
+            # -------------------------------------------------------------
+            # 📤 2. ĐẾM RESPONSE TRẢ RA (GLOBAL), GIẢM IN-FLIGHT & GHI ĐỘ TRỄ
+            # -------------------------------------------------------------
+            try:
+                HTTP_GLOBAL_REQUESTS_IN_FLIGHT.labels(host_ip=HOST_IP).dec()
+                HTTP_GLOBAL_RESPONSES_TOTAL.labels(
+                    method=method,
+                    status=str(status_code),
+                    host_ip=HOST_IP,
+                ).inc()
+                HTTP_GLOBAL_REQUEST_DURATION_SECONDS.labels(
+                    method=method,
+                    host_ip=HOST_IP,
+                ).observe(duration)
+            except Exception as e:
+                logger.debug(f"Error recording global response metrics: {e}")
+
+            if initial_api_group:
+                try:
+                    HTTP_REQUESTS_IN_FLIGHT.labels(api_group=initial_api_group, host_ip=HOST_IP).dec()
+                except Exception as e:
+                    logger.debug(f"Error decrementing detailed in-flight metric: {e}")
+
+            # -------------------------------------------------------------
+            # 3. KIỂM TRA ĐIỀU KIỆN ẨN / HIDE TẦNG CHI TIẾT (Router-level)
+            # -------------------------------------------------------------
+            # A. Kiểm tra nếu URL Path bị exclude trong .env
+            if any(path.startswith(prefix) for prefix in self.excluded_paths):
+                return
+
+            # B. Kiểm tra nếu endpoint chủ động set skip_metrics
+            if isinstance(state, dict) and state.get("skip_metrics") is True:
+                return
+
+            route = scope.get("route") or scope.get("endpoint")
+
+            # C. Kiểm tra nếu Router Tag bị exclude trong .env
+            if route and hasattr(route, "tags") and route.tags:
+                if any(t.lower() in self.excluded_tags for t in route.tags):
+                    return
+
+            # -------------------------------------------------------------
+            # 4. GHI NHẬN CHI TIẾT CHO CÁC ROUTER ĐƯỢC BẬT (REQUEST, RESPONSE, LATENCY)
+            # -------------------------------------------------------------
+            api_group = "unknown"
+
+            # Resolve handler / route template for metrics
             if isinstance(state, dict) and "custom_metric_path" in state:
                 handler = state["custom_metric_path"]
             else:
-                route = scope.get("route") or scope.get("endpoint")
                 if route and hasattr(route, "path"):
                     route_path = route.path
+                    if hasattr(route, "tags") and route.tags:
+                        valid_tags = [t for t in route.tags if t.lower() not in self.excluded_tags]
+                        if valid_tags:
+                            api_group = valid_tags[0]
+
                     # For dynamic routes with {system}, {router}, {path:path} or catch-all {path}, use actual request path
                     if "{path" in route_path or "{system}" in route_path or "{router}" in route_path:
                         handler = scope.get("path", route_path)
+                        if api_group == "unknown":
+                            api_group = "Dynamic APIs"
                     else:
                         handler = route_path
                 else:
                     handler = scope.get("path", "unknown")
 
-            # Update metrics
+            if isinstance(state, dict) and "custom_api_group" in state:
+                api_group = state["custom_api_group"]
+            elif api_group == "unknown":
+                if path in ("/", "/health"):
+                    api_group = "System"
+                elif path.startswith("/api/v1/items"):
+                    api_group = "Items"
+
+            # Update detailed metrics: cả Incoming Request, Completed Response và Latency
             try:
-                HTTP_REQUESTS_TOTAL.labels(
+                HTTP_REQUESTS_INCOMING_TOTAL.labels(
+                    method=method,
+                    handler=handler,
+                    host_ip=HOST_IP,
+                    api_group=api_group,
+                ).inc()
+                HTTP_RESPONSES_TOTAL.labels(
                     method=method,
                     handler=handler,
                     status=str(status_code),
                     host_ip=HOST_IP,
+                    api_group=api_group,
                 ).inc()
                 HTTP_REQUEST_DURATION_SECONDS.labels(
                     method=method,
                     handler=handler,
                     host_ip=HOST_IP,
+                    api_group=api_group,
                 ).observe(duration)
             except Exception as e:
-                logger.debug(f"Error recording metrics: {e}")
+                logger.debug(f"Error recording detailed metrics: {e}")
 
 
 def get_latest_metrics() -> bytes:

@@ -53,7 +53,8 @@ async def test_metrics_middleware_tracking():
 
     # Verify metrics generated include host_ip
     raw_metrics = get_latest_metrics().decode("utf-8")
-    assert "http_requests_total" in raw_metrics
+    assert "http_responses_total" in raw_metrics
+    assert "http_requests_incoming_total" in raw_metrics
     assert f'host_ip="{HOST_IP}"' in raw_metrics
 
 
@@ -131,5 +132,76 @@ def test_clean_multiproc_dir_removes_stale_files():
         # Run cleanup with clean_all=True (force wipe mode)
         clean_multiproc_dir(path=temp_dir, clean_all=True)
         assert not os.path.exists(active_file)
+
+
+@pytest.mark.asyncio
+async def test_metrics_api_group_and_exclusions():
+    """Test that api_group label is separated and excluded routers/paths/flags are not tracked."""
+    from fastapi import APIRouter, Request, FastAPI
+    from app.core.metrics import PrometheusMiddleware
+
+    test_app = FastAPI()
+    test_app.add_middleware(PrometheusMiddleware)
+
+    # 1. Router with normal tag
+    user_router = APIRouter(prefix="/users", tags=["Users"])
+    @user_router.get("/list")
+    async def list_users():
+        return {"users": []}
+
+    # 2. Router with excluded tag
+    secret_router = APIRouter(prefix="/secret", tags=["no-metrics"])
+    @secret_router.get("/data")
+    async def secret_data():
+        return {"secret": True}
+
+    # 3. Endpoint that programmatically skips metrics
+    @test_app.get("/skip-endpoint")
+    async def skip_endpoint(request: Request):
+        request.state.skip_metrics = True
+        return {"skipped": True}
+
+    test_app.include_router(user_router)
+    test_app.include_router(secret_router)
+
+    transport = ASGITransport(app=test_app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Call normal user endpoint
+        res1 = await client.get("/users/list")
+        assert res1.status_code == 200
+
+        # Call secret router endpoint (should be skipped)
+        res2 = await client.get("/secret/data")
+        assert res2.status_code == 200
+
+        # Call skip-endpoint (should be skipped)
+        res3 = await client.get("/skip-endpoint")
+        assert res3.status_code == 200
+
+        # Call excluded path (/docs)
+        res4 = await client.get("/docs")
+        # May be 404 on subapp without docs registered, but middleware should intercept path
+
+    raw_metrics = get_latest_metrics().decode("utf-8")
+
+    # 1. Tầng 1 (Global Metrics): Luôn ghi nhận toàn bộ requests và responses (100% traffic)
+    assert "http_global_requests_incoming_total" in raw_metrics
+    assert "http_global_responses_total" in raw_metrics
+    assert "http_global_requests_in_flight" in raw_metrics
+    assert "http_global_request_duration_seconds" in raw_metrics
+
+    # 2. Tầng 2 (Detailed Metrics): Chỉ ghi nhận các Router được bật
+    # Router "Users" được bật -> Có đầy đủ incoming, response, duration với api_group="Users"
+    assert "http_requests_incoming_total" in raw_metrics
+    assert "http_responses_total" in raw_metrics
+    assert "http_request_duration_seconds" in raw_metrics
+    assert 'api_group="Users"' in raw_metrics
+    assert 'handler="/users/list"' in raw_metrics
+
+    # Router "no-metrics", "skip-endpoint", "/docs" bị tắt ở tầng chi tiết -> KHÔNG xuất hiện trong Tầng 2
+    assert 'handler="/secret/data"' not in raw_metrics
+    assert 'handler="/skip-endpoint"' not in raw_metrics
+    assert 'handler="/docs"' not in raw_metrics
+
 
 

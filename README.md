@@ -126,14 +126,39 @@ Hệ thống tích hợp sẵn cơ chế tự động phát hiện IP của máy
    ```prometheus
    app_host_info{host_ip="192.168.43.54",hostname="my-computer",service_name="FastAPI Clean Architecture Demo"} 1.0
    ```
-3. **Request Metrics với nhãn `host_ip` và `api_group`**:
-   ```prometheus
-   http_requests_total{api_group="Items",handler="/api/v1/items",host_ip="192.168.43.54",method="GET",status="200"} 42.0
-   http_request_duration_seconds_bucket{api_group="Items",handler="/api/v1/items",host_ip="192.168.43.54",le="0.005",method="GET"} 40.0
-   ```
-4. **Cấu hình Bật / Tắt Metrics cho Router qua `.env`**:
-   - `PROMETHEUS_EXCLUDED_PATHS`: Tắt metrics theo tiền tố đường dẫn (vd: `/docs,/redoc,/openapi.json,/favicon.ico`).
-   - `PROMETHEUS_EXCLUDED_TAGS`: Tắt metrics theo router tag (vd: `no-metrics,Dynamic APIs`).
+3. **Mô hình Metrics 2 Tầng (2-Tier Observability)**:
+   - **Tầng 1 (Báo cáo Tổng - Toàn hệ thống)**: Luôn ghi nhận 100% requests, responses, in-flight load và phân bổ thời gian toàn server:
+     ```prometheus
+     # Đếm số lượng Request đi vào server (Incoming)
+     http_global_requests_incoming_total{host_ip="192.168.43.54",method="GET"} 1250.0
+
+     # Đếm số lượng Response trả ra cho client (Outgoing)
+     http_global_responses_total{host_ip="192.168.43.54",method="GET",status="200"} 1250.0
+
+     # Số lượng Request đang được xử lý đồng thời (In-flight load)
+     http_global_requests_in_flight{host_ip="192.168.43.54"} 3.0
+
+     # Phân bổ thời gian phản hồi toàn server (Latency Histogram)
+     http_global_request_duration_seconds_bucket{host_ip="192.168.43.54",le="0.005",method="GET"} 1200.0
+     ```
+   - **Tầng 2 (Báo cáo Riêng - Theo Router được bật / Có thể ẨN - HIDE)**: Đo đếm đầy đủ 4 chỉ số chi tiết cho từng Router được BẬT:
+     ```prometheus
+     # Đếm Request đi vào của từng Router
+     http_requests_incoming_total{api_group="Items",handler="/api/v1/items",host_ip="192.168.43.54",method="GET"} 42.0
+
+     # Đếm Response trả ra của từng Router
+     http_responses_total{api_group="Items",handler="/api/v1/items",host_ip="192.168.43.54",method="GET",status="200"} 42.0
+
+     # Số lượng Request đang xử lý dở của từng Router
+     http_requests_in_flight{api_group="Items",host_ip="192.168.43.54"} 1.0
+
+     # Độ trễ chi tiết của từng Router
+     http_request_duration_seconds_bucket{api_group="Items",handler="/api/v1/items",host_ip="192.168.43.54",le="0.005",method="GET"} 40.0
+     ```
+4. **Cấu hình Bật / Tắt / Ẩn (Hide) Metrics cho Router qua `.env`**:
+   - `PROMETHEUS_EXCLUDED_PATHS`: Ẩn metrics chi tiết theo tiền tố đường dẫn (vd: `/docs,/redoc,/openapi.json,/favicon.ico`).
+   - `PROMETHEUS_EXCLUDED_TAGS`: Ẩn metrics chi tiết theo router tag (vd: `no-metrics,Dynamic APIs`).
+   *(Khi một router bị ẩn ở Tầng 2, toàn bộ 4 chỉ số trên của router đó sẽ không sinh ra time-series, nhưng số request & response của nó vẫn được tính đầy đủ vào Báo cáo Tổng ở Tầng 1).*
 
 ---
 

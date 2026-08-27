@@ -14,6 +14,8 @@ try:
         PROMETHEUS_METRICS_ENABLED: bool = True
         PROMETHEUS_METRICS_PORT: int = 10001
         PROMETHEUS_MULTIPROC_DIR: str = "/tmp/prometheus_multiproc_dir"
+        PROMETHEUS_EXCLUDED_PATHS: str = "/docs,/redoc,/openapi.json,/favicon.ico"
+        PROMETHEUS_EXCLUDED_TAGS: str = "no-metrics,exclude-metrics"
 
         # Host Machine Info for Metrics
         HOST_IP: Optional[str] = None
@@ -31,6 +33,8 @@ except ImportError:
         PROMETHEUS_METRICS_ENABLED: bool = os.getenv("PROMETHEUS_METRICS_ENABLED", "true").lower() == "true"
         PROMETHEUS_METRICS_PORT: int = int(os.getenv("PROMETHEUS_METRICS_PORT", "10001"))
         PROMETHEUS_MULTIPROC_DIR: str = os.getenv("PROMETHEUS_MULTIPROC_DIR", "/tmp/prometheus_multiproc_dir")
+        PROMETHEUS_EXCLUDED_PATHS: str = os.getenv("PROMETHEUS_EXCLUDED_PATHS", "/docs,/redoc,/openapi.json,/favicon.ico")
+        PROMETHEUS_EXCLUDED_TAGS: str = os.getenv("PROMETHEUS_EXCLUDED_TAGS", "no-metrics,exclude-metrics")
         HOST_IP: Optional[str] = os.getenv("HOST_IP")
         HOST_NAME: Optional[str] = os.getenv("HOST_NAME")
 
