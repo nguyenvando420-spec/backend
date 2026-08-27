@@ -126,11 +126,14 @@ Hệ thống tích hợp sẵn cơ chế tự động phát hiện IP của máy
    ```prometheus
    app_host_info{host_ip="192.168.43.54",hostname="my-computer",service_name="FastAPI Clean Architecture Demo"} 1.0
    ```
-3. **Request Metrics với nhãn `host_ip`**:
+3. **Request Metrics với nhãn `host_ip` và `api_group`**:
    ```prometheus
-   http_requests_total{handler="/api/v1/items",host_ip="192.168.43.54",method="GET",status="200"} 42.0
-   http_request_duration_seconds_bucket{handler="/api/v1/items",host_ip="192.168.43.54",le="0.005",method="GET"} 40.0
+   http_requests_total{api_group="Items",handler="/api/v1/items",host_ip="192.168.43.54",method="GET",status="200"} 42.0
+   http_request_duration_seconds_bucket{api_group="Items",handler="/api/v1/items",host_ip="192.168.43.54",le="0.005",method="GET"} 40.0
    ```
+4. **Cấu hình Bật / Tắt Metrics cho Router qua `.env`**:
+   - `PROMETHEUS_EXCLUDED_PATHS`: Tắt metrics theo tiền tố đường dẫn (vd: `/docs,/redoc,/openapi.json,/favicon.ico`).
+   - `PROMETHEUS_EXCLUDED_TAGS`: Tắt metrics theo router tag (vd: `no-metrics,Dynamic APIs`).
 
 ---
 
