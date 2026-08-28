@@ -104,6 +104,11 @@ async def test_dynamic_api_metrics_tracking():
     assert 'handler="/billing/invoices/pay/v1"' in raw_metrics
     assert 'handler="/api/v1/auth/oauth/callback/google"' in raw_metrics
 
+    # Verify api_group matches across all metrics
+    assert 'api_group="Crm"' in raw_metrics
+    assert 'api_group="Billing"' in raw_metrics
+    assert 'api_group="Auth"' in raw_metrics
+
     # The generic placeholder template must NOT be present in metrics
     assert 'handler="/{system}/{router}/{path:path}"' not in raw_metrics
     assert 'handler="/api/v1/{system}/{router}/{path:path}"' not in raw_metrics
@@ -229,8 +234,9 @@ def test_fast_extract_api_group():
     assert fast_extract_api_group("/api/v1/auth/oauth/callback/google") == "Auth"
 
     # 3. Dynamic routes without /api/v1 prefix
-    assert fast_extract_api_group("/crm/users/profile") == "Dynamic APIs"
-    assert fast_extract_api_group("/billing/invoices/pay/v1") == "Dynamic APIs"
+    assert fast_extract_api_group("/crm/users/profile") == "Crm"
+    assert fast_extract_api_group("/billing/invoices/pay/v1") == "Billing"
+    assert fast_extract_api_group("/users/list") == "Users"
 
 
 

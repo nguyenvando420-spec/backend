@@ -248,17 +248,17 @@ def fast_extract_api_group(path: str) -> str:
     # Xử lý router có tiền tố /api/v1/..., /api/v2/...
     if segments[0] == "api":
         if len(segments) >= 3:
-            # e.g. api/v1/items -> "Items", api/v1/user-profiles -> "User Profiles"
+            # e.g. api/v1/items -> "Items", api/v1/user-profiles -> "User Profiles", api/v1/auth -> "Auth"
             return segments[2].replace("-", " ").replace("_", " ").title()
         elif len(segments) == 2:
             return segments[1].title()
         return "System"
 
-    # Xử lý dynamic URL không có tiền tố /api/v1 (e.g. /crm/users/..., /billing/invoices/...)
-    if len(segments) >= 2:
-        return "Dynamic APIs"
+    # Xử lý router không có tiền tố /api (e.g. /users/list -> "Users", /crm/users -> "Crm", /billing/pay -> "Billing")
+    if segments:
+        return segments[0].replace("-", " ").replace("_", " ").title()
 
-    return segments[0].title() if segments else "System"
+    return "System"
 
 
 class PrometheusMiddleware:
@@ -289,18 +289,18 @@ class PrometheusMiddleware:
         except Exception as e:
             logger.debug(f"Error recording incoming request metrics: {e}")
 
-        # Tầng 2: Xác định api_group ban đầu siêu tốc để đo in-flight nếu router không bị exclude
-        initial_api_group = None
+        # Tầng 2: Xác định api_group siêu tốc (đồng bộ 100% cho IN_FLIGHT, INCOMING, RESPONSE và LATENCY)
+        api_group = None
         if not (self.excluded_paths and path.startswith(self.excluded_paths)):
-            initial_api_group = fast_extract_api_group(path)
+            api_group = fast_extract_api_group(path)
 
-            if initial_api_group and initial_api_group.lower() not in self.excluded_tags:
+            if api_group and api_group.lower() not in self.excluded_tags:
                 try:
-                    HTTP_REQUESTS_IN_FLIGHT.labels(api_group=initial_api_group, host_ip=HOST_IP).inc()
+                    HTTP_REQUESTS_IN_FLIGHT.labels(api_group=api_group, host_ip=HOST_IP).inc()
                 except Exception as e:
                     logger.debug(f"Error recording detailed in-flight metric: {e}")
             else:
-                initial_api_group = None
+                api_group = None
 
         start_time = time.perf_counter()
         status_code = 500
@@ -337,16 +337,19 @@ class PrometheusMiddleware:
             except Exception as e:
                 logger.debug(f"Error recording global response metrics: {e}")
 
-            if initial_api_group:
+            if api_group:
                 try:
-                    HTTP_REQUESTS_IN_FLIGHT.labels(api_group=initial_api_group, host_ip=HOST_IP).dec()
+                    HTTP_REQUESTS_IN_FLIGHT.labels(api_group=api_group, host_ip=HOST_IP).dec()
                 except Exception as e:
                     logger.debug(f"Error decrementing detailed in-flight metric: {e}")
 
             # -------------------------------------------------------------
             # 3. KIỂM TRA ĐIỀU KIỆN ẨN / HIDE TẦNG CHI TIẾT (Router-level)
             # -------------------------------------------------------------
-            # A. Kiểm tra nếu URL Path bị exclude trong .env
+            # A. Kiểm tra nếu URL Path bị exclude trong .env hoặc không có api_group hợp lệ
+            if api_group is None:
+                return
+
             if self.excluded_paths and path.startswith(self.excluded_paths):
                 return
 
@@ -364,54 +367,43 @@ class PrometheusMiddleware:
             # -------------------------------------------------------------
             # 4. GHI NHẬN CHI TIẾT CHO CÁC ROUTER ĐƯỢC BẬT (REQUEST, RESPONSE, LATENCY)
             # -------------------------------------------------------------
-            api_group = "unknown"
-
             # Resolve handler / route template for metrics
             if isinstance(state, dict) and "custom_metric_path" in state:
                 handler = state["custom_metric_path"]
             else:
                 if route and hasattr(route, "path"):
                     route_path = route.path
-                    if hasattr(route, "tags") and route.tags:
-                        valid_tags = [t for t in route.tags if t.lower() not in self.excluded_tags]
-                        if valid_tags:
-                            api_group = valid_tags[0]
-
                     # For dynamic routes with {system}, {router}, {path:path} or catch-all {path}, use actual request path
                     if "{path" in route_path or "{system}" in route_path or "{router}" in route_path:
                         handler = scope.get("path", route_path)
-                        if api_group == "unknown":
-                            api_group = "Dynamic APIs"
                     else:
                         handler = route_path
                 else:
                     handler = scope.get("path", "unknown")
 
-            if isinstance(state, dict) and "custom_api_group" in state:
-                api_group = state["custom_api_group"]
-            elif api_group == "unknown":
-                api_group = fast_extract_api_group(path)
+            # Cho phép override api_group nếu endpoint có set custom_api_group trong state
+            final_api_group = state.get("custom_api_group", api_group) if isinstance(state, dict) else api_group
 
-            # Update detailed metrics: cả Incoming Request, Completed Response và Latency
+            # Update detailed metrics: cả Incoming Request, Completed Response và Latency (đồng nhất với IN_FLIGHT)
             try:
                 HTTP_REQUESTS_INCOMING_TOTAL.labels(
                     method=method,
                     handler=handler,
                     host_ip=HOST_IP,
-                    api_group=api_group,
+                    api_group=final_api_group,
                 ).inc()
                 HTTP_RESPONSES_TOTAL.labels(
                     method=method,
                     handler=handler,
                     status=str(status_code),
                     host_ip=HOST_IP,
-                    api_group=api_group,
+                    api_group=final_api_group,
                 ).inc()
                 HTTP_REQUEST_DURATION_SECONDS.labels(
                     method=method,
                     handler=handler,
                     host_ip=HOST_IP,
-                    api_group=api_group,
+                    api_group=final_api_group,
                 ).observe(duration)
             except Exception as e:
                 logger.debug(f"Error recording detailed metrics: {e}")
