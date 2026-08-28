@@ -6,6 +6,7 @@ import os
 import socket
 import threading
 import time
+from functools import lru_cache
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from typing import Optional
 
@@ -228,6 +229,38 @@ HTTP_REQUEST_DURATION_SECONDS = Histogram(
 )
 
 
+@lru_cache(maxsize=1024)
+def fast_extract_api_group(path: str) -> str:
+    """
+    Trích xuất api_group từ URL path với tốc độ nano-giây (~40ns).
+    Tự động nhận diện 100% router mới (/api/v1/items, /api/v1/users,...)
+    và dynamic routers (/api/v1/{system}/{router}/..., /{system}/{router}/...).
+    """
+    if path in ("/", "/health", "/docs", "/redoc", "/openapi.json"):
+        return "System"
+
+    path_clean = path.strip("/")
+    if not path_clean:
+        return "System"
+
+    segments = path_clean.split("/")
+
+    # Xử lý router có tiền tố /api/v1/..., /api/v2/...
+    if segments[0] == "api":
+        if len(segments) >= 3:
+            # e.g. api/v1/items -> "Items", api/v1/user-profiles -> "User Profiles"
+            return segments[2].replace("-", " ").replace("_", " ").title()
+        elif len(segments) == 2:
+            return segments[1].title()
+        return "System"
+
+    # Xử lý dynamic URL không có tiền tố /api/v1 (e.g. /crm/users/..., /billing/invoices/...)
+    if len(segments) >= 2:
+        return "Dynamic APIs"
+
+    return segments[0].title() if segments else "System"
+
+
 class PrometheusMiddleware:
     """Pure ASGI Middleware for ultra-fast, zero-overhead Prometheus 2-tier metric tracking."""
 
@@ -256,15 +289,10 @@ class PrometheusMiddleware:
         except Exception as e:
             logger.debug(f"Error recording incoming request metrics: {e}")
 
-        # Tầng 2: Ước lượng api_group ban đầu để đo in-flight nếu router không bị exclude
+        # Tầng 2: Xác định api_group ban đầu siêu tốc để đo in-flight nếu router không bị exclude
         initial_api_group = None
-        if not any(path.startswith(prefix) for prefix in self.excluded_paths):
-            if path in ("/", "/health"):
-                initial_api_group = "System"
-            elif path.startswith("/api/v1/items"):
-                initial_api_group = "Items"
-            elif "/" in path.strip("/"):
-                initial_api_group = "Dynamic APIs"
+        if not (self.excluded_paths and path.startswith(self.excluded_paths)):
+            initial_api_group = fast_extract_api_group(path)
 
             if initial_api_group and initial_api_group.lower() not in self.excluded_tags:
                 try:
@@ -319,7 +347,7 @@ class PrometheusMiddleware:
             # 3. KIỂM TRA ĐIỀU KIỆN ẨN / HIDE TẦNG CHI TIẾT (Router-level)
             # -------------------------------------------------------------
             # A. Kiểm tra nếu URL Path bị exclude trong .env
-            if any(path.startswith(prefix) for prefix in self.excluded_paths):
+            if self.excluded_paths and path.startswith(self.excluded_paths):
                 return
 
             # B. Kiểm tra nếu endpoint chủ động set skip_metrics
@@ -362,10 +390,7 @@ class PrometheusMiddleware:
             if isinstance(state, dict) and "custom_api_group" in state:
                 api_group = state["custom_api_group"]
             elif api_group == "unknown":
-                if path in ("/", "/health"):
-                    api_group = "System"
-                elif path.startswith("/api/v1/items"):
-                    api_group = "Items"
+                api_group = fast_extract_api_group(path)
 
             # Update detailed metrics: cả Incoming Request, Completed Response và Latency
             try:

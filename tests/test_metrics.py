@@ -4,7 +4,14 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from app.main import app
-from app.core.metrics import metrics_server, get_latest_metrics, clean_multiproc_dir, HOST_IP, HOSTNAME
+from app.core.metrics import (
+    metrics_server,
+    get_latest_metrics,
+    clean_multiproc_dir,
+    fast_extract_api_group,
+    HOST_IP,
+    HOSTNAME,
+)
 from app.core.config import settings
 
 
@@ -202,6 +209,29 @@ async def test_metrics_api_group_and_exclusions():
     assert 'handler="/secret/data"' not in raw_metrics
     assert 'handler="/skip-endpoint"' not in raw_metrics
     assert 'handler="/docs"' not in raw_metrics
+
+
+def test_fast_extract_api_group():
+    """Test fast nano-second extraction of api_group for static, dynamic, and system routes."""
+    # 1. System routes
+    assert fast_extract_api_group("/") == "System"
+    assert fast_extract_api_group("/health") == "System"
+    assert fast_extract_api_group("/docs") == "System"
+    assert fast_extract_api_group("/redoc") == "System"
+    assert fast_extract_api_group("/openapi.json") == "System"
+
+    # 2. Standard API routes under /api/v1 (static & dynamic)
+    assert fast_extract_api_group("/api/v1/items") == "Items"
+    assert fast_extract_api_group("/api/v1/items/123") == "Items"
+    assert fast_extract_api_group("/api/v1/users") == "Users"
+    assert fast_extract_api_group("/api/v1/user-profiles/info") == "User Profiles"
+    assert fast_extract_api_group("/api/v1/order_items/345") == "Order Items"
+    assert fast_extract_api_group("/api/v1/auth/oauth/callback/google") == "Auth"
+
+    # 3. Dynamic routes without /api/v1 prefix
+    assert fast_extract_api_group("/crm/users/profile") == "Dynamic APIs"
+    assert fast_extract_api_group("/billing/invoices/pay/v1") == "Dynamic APIs"
+
 
 
 
