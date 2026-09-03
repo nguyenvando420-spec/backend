@@ -30,3 +30,11 @@ echo "📍 Tên máy tính (Hostname):  ${HOST_NAME:-localhost}"
 echo "========================================================"
 
 docker compose up -d "$@"
+
+echo "========================================================"
+echo "✨ Hệ thống đã được khởi chạy thành công:"
+echo "👉 FastAPI Swagger UI:     http://localhost:8000/docs"
+echo "👉 Prometheus Metrics:     http://localhost:10001/metrics"
+echo "👉 VictoriaMetrics Web UI: http://localhost:8428/vmui"
+echo "👉 Grafana Dashboard:      http://localhost:3000 (admin / admin)"
+echo "========================================================"

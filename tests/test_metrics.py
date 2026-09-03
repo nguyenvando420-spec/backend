@@ -146,6 +146,28 @@ def test_clean_multiproc_dir_removes_stale_files():
         assert not os.path.exists(active_file)
 
 
+def test_is_stale_metric_file_logic():
+    """Test individual file stale detection logic for .tmp, .db, and other files."""
+    from app.core.metrics import is_stale_metric_file
+
+    current_pid = os.getpid()
+
+    # 1. Temporary files always stale
+    assert is_stale_metric_file("metrics_123.tmp") is True
+
+    # 2. Non-metric files ignored
+    assert is_stale_metric_file("readme.txt") is False
+    assert is_stale_metric_file(".gitkeep") is False
+
+    # 3. Active PID db file preserved
+    assert is_stale_metric_file(f"counter_{current_pid}.db") is False
+    assert is_stale_metric_file(f"gauge_livesum_{current_pid}.db") is False
+
+    # 4. Dead / invalid PID db file is stale
+    assert is_stale_metric_file("counter_999999.db") is True
+    assert is_stale_metric_file("invalid_db_without_pid.db") is True
+
+
 @pytest.mark.asyncio
 async def test_metrics_api_group_and_exclusions():
     """Test that api_group label is separated and excluded routers/paths/flags are not tracked."""
@@ -237,6 +259,25 @@ def test_fast_extract_api_group():
     assert fast_extract_api_group("/crm/users/profile") == "Crm"
     assert fast_extract_api_group("/billing/invoices/pay/v1") == "Billing"
     assert fast_extract_api_group("/users/list") == "Users"
+
+
+@pytest.mark.asyncio
+async def test_metrics_middleware_does_not_swallow_exceptions():
+    """Test that unhandled exceptions from downstream are not swallowed by finally block."""
+    from fastapi import FastAPI
+    from app.core.metrics import PrometheusMiddleware
+
+    test_app = FastAPI()
+    test_app.add_middleware(PrometheusMiddleware)
+
+    @test_app.get("/error-endpoint")
+    async def error_endpoint():
+        raise RuntimeError("Custom server crash")
+
+    transport = ASGITransport(app=test_app, raise_app_exceptions=True)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(RuntimeError, match="Custom server crash"):
+            await client.get("/error-endpoint")
 
 
 

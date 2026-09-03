@@ -99,21 +99,70 @@ pytest
 
 ## 🐳 Khởi chạy bằng Docker (Docker & Docker Compose)
 
-Chỉ cần một lệnh duy nhất để build và chạy toàn bộ hệ thống gồm **FastAPI Backend** và **PostgreSQL**:
+Chỉ cần một lệnh duy nhất để build và chạy toàn bộ hệ sinh thái gồm **FastAPI Backend**, **PostgreSQL**, **VictoriaMetrics** và **Grafana**:
 
 ```bash
 docker compose up -d --build
+# Hoặc chạy script tự động nhận diện IP:
+./start_docker.sh
 ```
 
+Các cổng dịch vụ sẵn sàng truy cập:
 - **FastAPI API & Swagger UI**: [http://localhost:8000/docs](http://localhost:8000/docs)
 - **FastAPI Health & Host IP**: [http://localhost:8000/health](http://localhost:8000/health)
 - **Prometheus Metrics Server**: [http://localhost:10001/metrics](http://localhost:10001/metrics)
-- **Metrics Health Server**: [http://localhost:10001/health](http://localhost:10001/health)
+- **VictoriaMetrics Web UI (vmui)**: [http://localhost:8428/vmui](http://localhost:8428/vmui)
+- **Grafana Dashboard**: [http://localhost:3000](http://localhost:3000) *(Tài khoản: `admin` / Mật khẩu: `admin`)*
 
-Để dừng dịch vụ:
+Để dừng toàn bộ dịch vụ:
 ```bash
 docker compose down
 ```
+
+---
+
+## 📈 Giám sát hệ thống với VictoriaMetrics & Grafana (Monitoring & Observability)
+
+Hệ thống được tích hợp sẵn giải pháp giám sát thời gian thực chuẩn production:
+
+```text
+┌─────────────────────────────────┐
+│     FastAPI Backend             │
+│   (Port 8000 API)               │
+│   (Port 10001 /metrics)         │
+└────────────────┬────────────────┘
+                 │ (Scrape mỗi 5s)
+                 ▼
+┌─────────────────────────────────┐
+│     VictoriaMetrics (TSDB)      │
+│   (Port 8428 /vmui)             │
+│   - Lưu trữ Time-series         │
+│   - Tương thích 100% Prometheus │
+└────────────────┬────────────────┘
+                 │ (Query qua PromQL / MetricsQL)
+                 ▼
+┌─────────────────────────────────┐
+│     Grafana Dashboard           │
+│   (Port 3000)                   │
+│   - Tự động nạp Datasource      │
+│   - Dashboard dựng sẵn          │
+│   - Đo lường Tầng 1 & Tầng 2    │
+└─────────────────────────────────┘
+```
+
+### 1. VictoriaMetrics (TSDB & Scraper)
+- **Cấu hình Scraper**: Nằm tại `monitoring/victoriametrics/scrape.yml`. Tự động scrape định kỳ mỗi 5s từ `127.0.0.1:10001/metrics`.
+- **Giao diện VMUI**: Truy cập [http://localhost:8428/vmui](http://localhost:8428/vmui) để viết và kiểm tra trực tiếp các câu query MetricsQL/PromQL.
+- **Tự giám sát**: VictoriaMetrics cũng tự scrape metrics hiệu năng nội tại của chính nó.
+
+### 2. Grafana (Visualization Dashboard)
+- **Datasource tự động (Provisioning)**: Nằm tại `monitoring/grafana/provisioning/datasources/datasource.yml`, tự động liên kết với VictoriaMetrics làm default datasource mà không cần cấu hình bằng tay.
+- **Dashboard dựng sẵn**: Nằm tại `monitoring/grafana/dashboards/fastapi_monitoring.json`, tự động xuất hiện trong thư mục `FastAPI` với tên **FastAPI Backend Observability Dashboard**:
+  - **Quick Stats**: Service Info, Total Incoming RPS, Active In-Flight Requests, Success Rate (2xx), Server Error Rate (5xx), Avg Latency.
+  - **Tầng 1 (Global Metrics)**: Biểu đồ RPS theo HTTP Method, Response Rate theo Status Code (2xx/4xx/5xx), Phân bổ độ trễ (p50, p90, p95, p99), In-Flight concurrency load.
+  - **Tầng 2 (Detailed Router Metrics)**: RPS theo từng `api_group`, Top 10 Active Endpoints, p95 Latency theo từng API Group, In-Flight load theo API Group.
+  - **🔥 Dynamic Top Requests per Group (Tự động sinh biểu đồ)**: Sử dụng cơ chế Panel Repeat của Grafana theo biến `$api_group`. Khi có bất kỳ Router/API Group mới nào phát sinh traffic (ví dụ: `Items`, `Auth`, `Crm`, `Billing`,...), Grafana sẽ tự động tạo ra một biểu đồ riêng hiển thị Top 5 Endpoints có lưu lượng cao nhất thuộc nhóm đó mà không cần cấu hình thủ công!
+  - **Bảng tổng kết Endpoint Summary**: Liệt kê chi tiết Endpoint Path, API Group, HTTP Method và lượng Requests/giây.
 
 ---
 

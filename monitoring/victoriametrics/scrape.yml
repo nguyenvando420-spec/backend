@@ -1,0 +1,21 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+
+scrape_configs:
+  - job_name: 'fastapi-backend'
+    metrics_path: '/metrics'
+    static_configs:
+      # Khi dùng network_mode: "host", Backend lắng nghe trên 127.0.0.1:10001
+      # Nếu chuyển sang Docker bridge network thông thường, đổi thành ['backend:10001']
+      - targets: ['127.0.0.1:10001']
+        labels:
+          service: 'fastapi-backend'
+          env: 'production'
+
+  - job_name: 'victoriametrics'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['127.0.0.1:8428']
+        labels:
+          service: 'victoriametrics'

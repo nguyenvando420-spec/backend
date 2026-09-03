@@ -26,6 +26,33 @@ def is_pid_alive(pid: int) -> bool:
         return False
 
 
+def is_stale_metric_file(filename: str) -> bool:
+    """
+    Check if a multiprocess metric file (.db, .tmp) is stale.
+    Returns True if the file belongs to a dead process or is a temporary file.
+    """
+    if filename.endswith(".tmp"):
+        return True
+
+    if not filename.endswith(".db"):
+        return False
+
+    # Prometheus db files format: <type>_<pid>.db or <type>_<mode>_<pid>.db
+    parts = filename[:-3].rsplit("_", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        return not is_pid_alive(int(parts[1]))
+
+    return True
+
+
+def _remove_file_safely(file_path: str) -> None:
+    """Safely remove a file, suppressing and logging any filesystem errors."""
+    try:
+        os.remove(file_path)
+    except Exception as e:
+        logger.debug(f"Error removing stale metrics file {file_path}: {e}")
+
+
 def clean_multiproc_dir(path: Optional[str] = None, clean_all: bool = False) -> None:
     """
     Clean up old metrics files (.db, .tmp) from the multiprocess directory.
@@ -44,25 +71,8 @@ def clean_multiproc_dir(path: Optional[str] = None, clean_all: bool = False) -> 
             if not os.path.isfile(file_path):
                 continue
 
-            should_remove = clean_all
-            if not should_remove:
-                if filename.endswith(".db"):
-                    # Prometheus db files format: <type>_<pid>.db or <type>_<mode>_<pid>.db
-                    parts = filename[:-3].rsplit("_", 1)
-                    if len(parts) == 2 and parts[1].isdigit():
-                        pid = int(parts[1])
-                        if not is_pid_alive(pid):
-                            should_remove = True
-                    else:
-                        should_remove = True
-                elif filename.endswith(".tmp"):
-                    should_remove = True
-
-            if should_remove:
-                try:
-                    os.remove(file_path)
-                except Exception as e:
-                    logger.debug(f"Error removing stale metrics file {file_path}: {e}")
+            if clean_all or is_stale_metric_file(filename):
+                _remove_file_safely(file_path)
     except Exception as e:
         logger.debug(f"Error scanning multiprocess directory {dir_path}: {e}")
 
@@ -272,6 +282,124 @@ class PrometheusMiddleware:
         raw_tags = getattr(settings, "PROMETHEUS_EXCLUDED_TAGS", "")
         self.excluded_tags = {t.strip().lower() for t in raw_tags.split(",") if t.strip()}
 
+    def _resolve_api_group(self, path: str) -> Optional[str]:
+        """Fast extraction of api_group, respecting path and tag exclusions."""
+        if self.excluded_paths and path.startswith(self.excluded_paths):
+            return None
+
+        api_group = fast_extract_api_group(path)
+        if api_group and api_group.lower() not in self.excluded_tags:
+            return api_group
+        return None
+
+    def _record_incoming(self, method: str, api_group: Optional[str]) -> None:
+        """Record incoming global requests and increment in-flight gauges."""
+        try:
+            HTTP_GLOBAL_REQUESTS_INCOMING_TOTAL.labels(method=method, host_ip=HOST_IP).inc()
+            HTTP_GLOBAL_REQUESTS_IN_FLIGHT.labels(host_ip=HOST_IP).inc()
+            if api_group:
+                HTTP_REQUESTS_IN_FLIGHT.labels(api_group=api_group, host_ip=HOST_IP).inc()
+        except Exception as e:
+            logger.debug(f"Error recording incoming request metrics: {e}")
+
+    def _record_global_response(
+        self, method: str, status_code: int, duration: float, api_group: Optional[str]
+    ) -> None:
+        """Record global completed response, decrement in-flight gauges, and observe latency."""
+        try:
+            HTTP_GLOBAL_REQUESTS_IN_FLIGHT.labels(host_ip=HOST_IP).dec()
+            HTTP_GLOBAL_RESPONSES_TOTAL.labels(
+                method=method,
+                status=str(status_code),
+                host_ip=HOST_IP,
+            ).inc()
+            HTTP_GLOBAL_REQUEST_DURATION_SECONDS.labels(
+                method=method,
+                host_ip=HOST_IP,
+            ).observe(duration)
+            if api_group:
+                HTTP_REQUESTS_IN_FLIGHT.labels(api_group=api_group, host_ip=HOST_IP).dec()
+        except Exception as e:
+            logger.debug(f"Error recording global response metrics: {e}")
+
+    def _is_detailed_tracking_enabled(
+        self, scope: Scope, path: str, api_group: Optional[str]
+    ) -> bool:
+        """Check if detailed (Tier 2) metric tracking is enabled for this route."""
+        if not api_group:
+            return False
+
+        if self.excluded_paths and path.startswith(self.excluded_paths):
+            return False
+
+        state = scope.get("state")
+        if isinstance(state, dict) and state.get("skip_metrics") is True:
+            return False
+
+        route = scope.get("route") or scope.get("endpoint")
+        if route and hasattr(route, "tags") and route.tags:
+            if any(t.lower() in self.excluded_tags for t in route.tags):
+                return False
+
+        return True
+
+    @staticmethod
+    def _resolve_handler_path(scope: Scope, path: str) -> str:
+        """Resolve endpoint handler template or custom metric path."""
+        state = scope.get("state")
+        if isinstance(state, dict) and "custom_metric_path" in state:
+            return str(state["custom_metric_path"])
+
+        route = scope.get("route") or scope.get("endpoint")
+        if not (route and hasattr(route, "path")):
+            return scope.get("path", "unknown")
+
+        route_path: str = route.path
+        if any(token in route_path for token in ("{path", "{system}", "{router}")):
+            return scope.get("path", route_path)
+        return route_path
+
+    def _record_detailed_metrics(
+        self,
+        scope: Scope,
+        method: str,
+        path: str,
+        status_code: int,
+        duration: float,
+        api_group: str,
+    ) -> None:
+        """Record detailed Tier-2 router metrics (incoming, response, latency)."""
+        handler = self._resolve_handler_path(scope, path)
+        state = scope.get("state")
+        final_group = (
+            state.get("custom_api_group", api_group)
+            if isinstance(state, dict)
+            else api_group
+        )
+
+        try:
+            HTTP_REQUESTS_INCOMING_TOTAL.labels(
+                method=method,
+                handler=handler,
+                host_ip=HOST_IP,
+                api_group=final_group,
+            ).inc()
+            HTTP_RESPONSES_TOTAL.labels(
+                method=method,
+                handler=handler,
+                status=str(status_code),
+                host_ip=HOST_IP,
+                api_group=final_group,
+            ).inc()
+            HTTP_REQUEST_DURATION_SECONDS.labels(
+                method=method,
+                handler=handler,
+                host_ip=HOST_IP,
+                api_group=final_group,
+            ).observe(duration)
+        except Exception as e:
+            logger.debug(f"Error recording detailed metrics: {e}")
+
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
@@ -279,28 +407,9 @@ class PrometheusMiddleware:
 
         method = scope.get("method", "GET")
         path = scope.get("path", "")
+        api_group = self._resolve_api_group(path)
 
-        # -------------------------------------------------------------
-        # 📥 1. ĐẾM REQUEST ĐI VÀO (GLOBAL INCOMING) & TĂNG IN-FLIGHT
-        # -------------------------------------------------------------
-        try:
-            HTTP_GLOBAL_REQUESTS_INCOMING_TOTAL.labels(method=method, host_ip=HOST_IP).inc()
-            HTTP_GLOBAL_REQUESTS_IN_FLIGHT.labels(host_ip=HOST_IP).inc()
-        except Exception as e:
-            logger.debug(f"Error recording incoming request metrics: {e}")
-
-        # Tầng 2: Xác định api_group siêu tốc (đồng bộ 100% cho IN_FLIGHT, INCOMING, RESPONSE và LATENCY)
-        api_group = None
-        if not (self.excluded_paths and path.startswith(self.excluded_paths)):
-            api_group = fast_extract_api_group(path)
-
-            if api_group and api_group.lower() not in self.excluded_tags:
-                try:
-                    HTTP_REQUESTS_IN_FLIGHT.labels(api_group=api_group, host_ip=HOST_IP).inc()
-                except Exception as e:
-                    logger.debug(f"Error recording detailed in-flight metric: {e}")
-            else:
-                api_group = None
+        self._record_incoming(method, api_group)
 
         start_time = time.perf_counter()
         status_code = 500
@@ -318,95 +427,12 @@ class PrometheusMiddleware:
             raise
         finally:
             duration = time.perf_counter() - start_time
-            state = scope.get("state", {})
+            self._record_global_response(method, status_code, duration, api_group)
 
-            # -------------------------------------------------------------
-            # 📤 2. ĐẾM RESPONSE TRẢ RA (GLOBAL), GIẢM IN-FLIGHT & GHI ĐỘ TRỄ
-            # -------------------------------------------------------------
-            try:
-                HTTP_GLOBAL_REQUESTS_IN_FLIGHT.labels(host_ip=HOST_IP).dec()
-                HTTP_GLOBAL_RESPONSES_TOTAL.labels(
-                    method=method,
-                    status=str(status_code),
-                    host_ip=HOST_IP,
-                ).inc()
-                HTTP_GLOBAL_REQUEST_DURATION_SECONDS.labels(
-                    method=method,
-                    host_ip=HOST_IP,
-                ).observe(duration)
-            except Exception as e:
-                logger.debug(f"Error recording global response metrics: {e}")
-
-            if api_group:
-                try:
-                    HTTP_REQUESTS_IN_FLIGHT.labels(api_group=api_group, host_ip=HOST_IP).dec()
-                except Exception as e:
-                    logger.debug(f"Error decrementing detailed in-flight metric: {e}")
-
-            # -------------------------------------------------------------
-            # 3. KIỂM TRA ĐIỀU KIỆN ẨN / HIDE TẦNG CHI TIẾT (Router-level)
-            # -------------------------------------------------------------
-            # A. Kiểm tra nếu URL Path bị exclude trong .env hoặc không có api_group hợp lệ
-            if api_group is None:
-                return
-
-            if self.excluded_paths and path.startswith(self.excluded_paths):
-                return
-
-            # B. Kiểm tra nếu endpoint chủ động set skip_metrics
-            if isinstance(state, dict) and state.get("skip_metrics") is True:
-                return
-
-            route = scope.get("route") or scope.get("endpoint")
-
-            # C. Kiểm tra nếu Router Tag bị exclude trong .env
-            if route and hasattr(route, "tags") and route.tags:
-                if any(t.lower() in self.excluded_tags for t in route.tags):
-                    return
-
-            # -------------------------------------------------------------
-            # 4. GHI NHẬN CHI TIẾT CHO CÁC ROUTER ĐƯỢC BẬT (REQUEST, RESPONSE, LATENCY)
-            # -------------------------------------------------------------
-            # Resolve handler / route template for metrics
-            if isinstance(state, dict) and "custom_metric_path" in state:
-                handler = state["custom_metric_path"]
-            else:
-                if route and hasattr(route, "path"):
-                    route_path = route.path
-                    # For dynamic routes with {system}, {router}, {path:path} or catch-all {path}, use actual request path
-                    if "{path" in route_path or "{system}" in route_path or "{router}" in route_path:
-                        handler = scope.get("path", route_path)
-                    else:
-                        handler = route_path
-                else:
-                    handler = scope.get("path", "unknown")
-
-            # Cho phép override api_group nếu endpoint có set custom_api_group trong state
-            final_api_group = state.get("custom_api_group", api_group) if isinstance(state, dict) else api_group
-
-            # Update detailed metrics: cả Incoming Request, Completed Response và Latency (đồng nhất với IN_FLIGHT)
-            try:
-                HTTP_REQUESTS_INCOMING_TOTAL.labels(
-                    method=method,
-                    handler=handler,
-                    host_ip=HOST_IP,
-                    api_group=final_api_group,
-                ).inc()
-                HTTP_RESPONSES_TOTAL.labels(
-                    method=method,
-                    handler=handler,
-                    status=str(status_code),
-                    host_ip=HOST_IP,
-                    api_group=final_api_group,
-                ).inc()
-                HTTP_REQUEST_DURATION_SECONDS.labels(
-                    method=method,
-                    handler=handler,
-                    host_ip=HOST_IP,
-                    api_group=final_api_group,
-                ).observe(duration)
-            except Exception as e:
-                logger.debug(f"Error recording detailed metrics: {e}")
+            if api_group and self._is_detailed_tracking_enabled(scope, path, api_group):
+                self._record_detailed_metrics(
+                    scope, method, path, status_code, duration, api_group
+                )
 
 
 def get_latest_metrics() -> bytes:
